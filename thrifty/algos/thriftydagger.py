@@ -3,7 +3,7 @@ import itertools
 import numpy as np
 import torch
 from torch.optim import Adam
-import gym
+import gymnasium as gym
 import time
 import thrifty.algos.core as core
 from thrifty.utils.logx import EpochLogger
@@ -403,6 +403,10 @@ def thrifty(env, iters=5, actor_critic=core.Ensemble, ac_kwargs=dict(),
                     qbuffer.store(o, a_expert, o2, int(s), (ep_len + 1 >= horizon) or s)
                 # hg-dagger switching for hg-dagger, or novelty switching for thriftydagger
                 elif (hg_dagger and hg_dagger()) or (not hg_dagger and ac.variance(o) > switch2human_thresh):
+                    """
+                    hg_dagger ensures the function exists (i.e., HG-DAgger is enabled).
+                    hg_dagger() checks the current user input.
+                    """
                     print("Switch to Human (Novel)")
                     num_switch_to_human += 1
                     expert_mode = True

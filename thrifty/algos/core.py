@@ -148,13 +148,16 @@ class MLP(nn.Module):
 
 class Ensemble(nn.Module):
     # Multiple policies
-    def __init__(self, observation_space, action_space, device, hidden_sizes=(256,256),
+    def __init__(self, observation_space, action_space, act_limit, device, hidden_sizes=(256,256),
                  activation=nn.ReLU, num_nets=5):
         super().__init__()
 
-        obs_dim = observation_space.shape[0]
-        act_dim = action_space.shape[0]
-        act_limit = action_space.high[0]
+        # obs_dim = observation_space.shape[0]
+        # act_dim = action_space.shape[0]
+        # act_limit = action_space.high[0]
+        obs_dim = observation_space
+        act_dim = action_space
+        act_limit = act_limit
         self.num_nets = num_nets
         self.device = device
         # build policy and value functions

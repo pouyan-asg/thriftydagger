@@ -11,14 +11,17 @@ import pickle
 import os
 import sys
 import random
+from glob import glob
 
 class ReplayBuffer:
     """
     A simple FIFO experience replay buffer.
     """
     def __init__(self, obs_dim, act_dim, size, device):
-        self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32) 
+        self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
+        print("Observation buffer shape:", self.obs_buf.shape)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
+        print("Action buffer shape:", self.act_buf.shape)
         self.ptr, self.size, self.max_size = 0, 0, size
         self.device = device
 
@@ -36,7 +39,9 @@ class ReplayBuffer:
 
     def fill_buffer(self, obs, act):
         for i in range(len(obs)):
-            self.store(obs[i], act[i])
+            # If act[i] is a dict, extract the array
+            action = act[i]['actions'] if isinstance(act[i], dict) else act[i]
+            self.store(obs[i], action)
 
     def save_buffer(self, name='replay'):
         pickle.dump({'obs_buf': self.obs_buf, 'act_buf': self.act_buf,
@@ -126,22 +131,28 @@ def generate_offline_data(env, expert_policy, num_episodes=0, output_file='data.
     i, failures = 0, 0
     np.random.seed(seed)
     obs, act, rew = [], [], []
-    act_limit = env.action_space.high[0]
+    act_limit = env.action_space.high[0]  # 1.0
+    print("Action limit:", act_limit)
     while i < num_episodes:
         print('Episode #{}'.format(i))
         o, total_ret, d, t = env.reset(), 0, False, 0
+        print("Initial observation:", o)
         curr_obs, curr_act = [], []
         if robosuite:
             robosuite_cfg['INPUT_DEVICE'].start_control()
         while not d:
             a = expert_policy(o)
+            print("Action taken 1:", a)
+            a = np.concatenate([a['right_abs'], a['right_gripper']])
+            print("Action taken 2:", a)
             if a is None:
                 d, r = True, 0
                 continue
             a = np.clip(a, -act_limit, act_limit)
+            print("Clipped action:", a)
             curr_obs.append(o)
             curr_act.append(a)
-            o, r, d, _ = env.step(a)
+            o, r, d, _, _ = env.step(a)
             if robosuite:
                 d = (t >= robosuite_cfg['MAX_EP_LEN']) or env._check_success()
                 r = int(env._check_success())
@@ -184,29 +195,51 @@ def thrifty(env, iters=5, actor_critic=core.Ensemble, ac_kwargs=dict(),
     num_test_episodes: run this many episodes after each iter without interventions
     init_model: initial NN weights
     """
+
+    # These lines set up logging, collect all local variables as the experiment config, 
+    # remove the environment object, and save the config for future reference.
     logger = EpochLogger(**logger_kwargs)
-    _locals = locals()
-    del _locals['env']
-    logger.save_config(_locals)
-    if device_idx >= 0:
-        device = torch.device("cuda", device_idx)
+    # TODO --------------------FOR NOW i SKIPPED THESE LOGGS BECAUSAE IT SHOWED ERRORS -------------------------
+    # print(logger)
+    # _locals = locals()
+    # _locals = locals()
+    # for key in list(_locals.keys()):
+    #     # Remove known problematic objects
+    #     if key in ['env', 'actor_critic', 'expert_policy', 'INPUT_DEVICE', 'hg_dagger', 'logger', 'robosuite_cfg']:
+    #         del _locals[key]
+    # print("Local variables:", _locals)
+    # logger.save_config(_locals)
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("CUDA is available. Using GPU.")
     else:
         device = torch.device("cpu")
+        print("CUDA is not available. Using CPU.")
+
+    # if device_idx >= 0:
+    #     device = torch.device("cuda", device_idx)
+    # else:
+    #     device = torch.device("cpu")
 
     torch.manual_seed(seed)
     np.random.seed(seed)
     if robosuite:
         with open(os.path.join(logger_kwargs['output_dir'],'model.xml'), 'w') as fh:
-            fh.write(env.env.sim.model.get_xml())
+            fh.write(env.env.sim.model.get_xml())  # save Mujoco model xml
 
-    obs_dim = env.observation_space.shape
+    # obs_dim = env.observation_space.shape
+    obs_dim = env.sim.get_state().flatten().shape[0]
     act_dim = env.action_space.shape[0]
     act_limit = env.action_space.high[0] 
+    print(f"Observation space: {obs_dim}, Action space: {act_dim}, Action limit: {act_limit}, replay_size: {replay_size}")
     assert act_limit == -1 * env.action_space.low[0], "Action space should be symmetric"
     horizon = robosuite_cfg['MAX_EP_LEN']
 
     # initialize actor and classifier NN
-    ac = actor_critic(env.observation_space, env.action_space, device, num_nets=num_nets, **ac_kwargs)
+    # ac = actor_critic(env.observation_space, env.action_space, device, num_nets=num_nets, **ac_kwargs)
+    ac = actor_critic(observation_space=obs_dim, action_space=act_dim, act_limit=act_limit, 
+                      device=device, num_nets=num_nets, **ac_kwargs)
     if init_model:
         ac = torch.load(init_model, map_location=device).to(device)
         ac.device = device
@@ -224,15 +257,33 @@ def thrifty(env, iters=5, actor_critic=core.Ensemble, ac_kwargs=dict(),
 
     # Experience buffer
     replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size, device=device)
-    input_data = pickle.load(open(input_file, 'rb'))
-    # shuffle and create small held out set to check valid loss
-    num_bc = len(input_data['obs'])
-    idxs = np.arange(num_bc)
-    np.random.shuffle(idxs)
-    replay_buffer.fill_buffer(input_data['obs'][idxs][:int(0.9*num_bc)], input_data['act'][idxs][:int(0.9*num_bc)])
-    held_out_data = {'obs': input_data['obs'][idxs][int(0.9*num_bc):], 'act': input_data['act'][idxs][int(0.9*num_bc):]}
-    qbuffer = QReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size, device=device)
-    qbuffer.fill_buffer_from_BC(input_data)
+    # input_data = pickle.load(open(input_file, 'rb'))
+    state_paths = os.path.join(input_file, "state_*.npz")
+    print("Loading data from:", state_paths)
+    for state_file in sorted(glob(state_paths)):
+        print(state_file)
+        dic = np.load(state_file, allow_pickle=True)
+        states_data = dic["states"]
+        actions_data = dic["action_infos"]
+        if len(states_data) == 0 or len(actions_data) == 0:
+            print("Skipping empty state or action arrays in file:", state_file)
+            continue
+        if states_data.shape[0] != actions_data.shape[0]:
+            print("Mismatch in number of states and actions in file:", state_file)
+            continue
+
+        # shuffle and create small held out set to check valid loss
+        num_bc = len(states_data)
+        idxs = np.arange(num_bc)
+        np.random.shuffle(idxs)
+        # print("Number of BC samples:", num_bc)  # 100
+        # print("Sampled indices:", idxs) # shuffled list of indices
+        # print("Sampled states shape:", states_data[idxs].shape)  # (100, 38)
+        # print(states_data[idxs][:int(0.9*num_bc)].shape)  # (90, 38)
+        replay_buffer.fill_buffer(states_data[idxs][:int(0.9*num_bc)], actions_data[idxs][:int(0.9*num_bc)])
+        held_out_data = {'obs': states_data[idxs][int(0.9*num_bc):], 'act': actions_data[idxs][int(0.9*num_bc):]}
+        # qbuffer = QReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size, device=device)
+        # qbuffer.fill_buffer_from_BC(dic)
 
     # Set up function for computing actor loss
     def compute_loss_pi(data, i):
@@ -278,42 +329,42 @@ def thrifty(env, iters=5, actor_critic=core.Ensemble, ac_kwargs=dict(),
                     p_targ.data.add_((1 - .995) * p.data)
         return loss_q.item()
 
+    # def test_agent(epoch=0):
+    #     """Run test episodes"""
+    #     obs, act, done, rew = [], [], [], []
+    #     for j in range(num_test_episodes):
+    #         o, d, ep_ret, ep_ret2, ep_len = env.reset(), False, 0, 0, 0
+    #         while not d:
+    #             obs.append(o)
+    #             a = ac.act(o)
+    #             a = np.clip(a, -act_limit, act_limit)
+    #             act.append(a)
+    #             o, r, d, _, _ = env.step(a)
+    #             if robosuite:
+    #                 d = (ep_len + 1 >= horizon) or env._check_success()
+    #                 ep_ret2 += int(env._check_success())
+    #                 done.append(d)
+    #                 rew.append(int(env._check_success()))
+    #             ep_ret += r
+    #             ep_len += 1
+    #         print('episode #{} success? {}'.format(j, rew[-1]))
+    #         if robosuite:
+    #             env.close()
+    #     print('Test Success Rate:', sum(rew)/num_test_episodes)
+    #     pickle.dump({'obs': np.stack(obs), 'act': np.stack(act), 'done': np.array(done), 'rew': np.array(rew)}, open('test-rollouts.pkl', 'wb'))
+    #     pickle.dump({'obs': np.stack(obs), 'act': np.stack(act), 'done': np.array(done), 'rew': np.array(rew)}, open(logger_kwargs['output_dir']+'/test{}.pkl'.format(epoch), 'wb'))
+
     # Prepare for interaction with environment
     online_burden = 0 # how many labels we get from supervisor
     num_switch_to_human = 0 # context switches (due to novelty)
     num_switch_to_human2 = 0 # context switches (due to risk)
     num_switch_to_robot = 0
 
-    def test_agent(epoch=0):
-        """Run test episodes"""
-        obs, act, done, rew = [], [], [], []
-        for j in range(num_test_episodes):
-            o, d, ep_ret, ep_ret2, ep_len = env.reset(), False, 0, 0, 0
-            while not d:
-                obs.append(o)
-                a = ac.act(o)
-                a = np.clip(a, -act_limit, act_limit)
-                act.append(a)
-                o, r, d, _ = env.step(a)
-                if robosuite:
-                    d = (ep_len + 1 >= horizon) or env._check_success()
-                    ep_ret2 += int(env._check_success())
-                    done.append(d)
-                    rew.append(int(env._check_success()))
-                ep_ret += r
-                ep_len += 1
-            print('episode #{} success? {}'.format(j, rew[-1]))
-            if robosuite:
-                env.close()
-        print('Test Success Rate:', sum(rew)/num_test_episodes)
-        pickle.dump({'obs': np.stack(obs), 'act': np.stack(act), 'done': np.array(done), 'rew': np.array(rew)}, open('test-rollouts.pkl', 'wb'))
-        pickle.dump({'obs': np.stack(obs), 'act': np.stack(act), 'done': np.array(done), 'rew': np.array(rew)}, open(logger_kwargs['output_dir']+'/test{}.pkl'.format(epoch), 'wb'))
+    # if iters == 0 and num_test_episodes > 0: # only run evaluation.
+    #     test_agent(0)
+    #     sys.exit(0)
 
-    if iters == 0 and num_test_episodes > 0: # only run evaluation.
-        test_agent(0)
-        sys.exit(0)
-
-    # train policy
+    # ------------------------- train policy ----------------------------
     for i in range(ac.num_nets):
         if ac.num_nets > 1: # create new datasets via sampling with replacement
             print('Net #{}'.format(i))
@@ -331,7 +382,7 @@ def thrifty(env, iters=5, actor_critic=core.Ensemble, ac_kwargs=dict(),
             validation = []
             for j in range(len(held_out_data['obs'])):
                 a_pred = ac.act(held_out_data['obs'][j], i=i)
-                a_sup = held_out_data['act'][j]
+                a_sup = held_out_data['act'][j]['actions']
                 validation.append(sum(a_pred - a_sup)**2)
             print('LossPi', sum(loss_pi)/len(loss_pi))
             print('LossValid', sum(validation)/len(validation))
@@ -346,7 +397,7 @@ def thrifty(env, iters=5, actor_critic=core.Ensemble, ac_kwargs=dict(),
     heldout_discrepancies, heldout_estimates = [], []
     for i in range(len(held_out_data['obs'])):
         a_pred = ac.act(held_out_data['obs'][i])
-        a_sup = held_out_data['act'][i]
+        a_sup = held_out_data['act'][i]['actions']
         heldout_discrepancies.append(sum((a_pred - a_sup)**2))
         heldout_estimates.append(ac.variance(held_out_data['obs'][i]))
     switch2robot_thresh = np.array(discrepancies).mean()
@@ -358,6 +409,7 @@ def thrifty(env, iters=5, actor_critic=core.Ensemble, ac_kwargs=dict(),
     switch2robot_thresh2 = 0.495
     torch.cuda.empty_cache()
     # we only needed the held out set to check valid loss and compute thresholds, so we can get rid of it.
+    # print(held_out_data['obs'].shape, held_out_data['act'].shape)
     replay_buffer.fill_buffer(held_out_data['obs'], held_out_data['act'])
 
     total_env_interacts = 0
@@ -374,6 +426,8 @@ def thrifty(env, iters=5, actor_critic=core.Ensemble, ac_kwargs=dict(),
             o, d, expert_mode, ep_len = env.reset(), False, False, 0
             if robosuite:
                 robosuite_cfg['INPUT_DEVICE'].start_control()
+            print(f"injaaaaaaaaaa: {o.shape}")
+            print(ac.variance(o).shape)
             obs, act, rew, done, sup, var, risk = [o], [], [], [], [], [ac.variance(o)], []
             if robosuite:
                 simstates = [env.env.sim.get_state().flatten()] # track this to replay trajectories after if desired.
@@ -394,13 +448,13 @@ def thrifty(env, iters=5, actor_critic=core.Ensemble, ac_kwargs=dict(),
                         print("Switch to Robot")
                         expert_mode = False 
                         num_switch_to_robot += 1
-                        o2, _, d, _ = env.step(a_expert)
+                        o2, _, d, _, _ = env.step(a_expert)
                     else:
-                        o2, _, d, _ = env.step(a_expert)
+                        o2, _, d, _, _ = env.step(a_expert)
                     act.append(a_expert)
                     sup.append(1)
                     s = env._check_success()
-                    qbuffer.store(o, a_expert, o2, int(s), (ep_len + 1 >= horizon) or s)
+                    # qbuffer.store(o, a_expert, o2, int(s), (ep_len + 1 >= horizon) or s)
                 # hg-dagger switching for hg-dagger, or novelty switching for thriftydagger
                 elif (hg_dagger and hg_dagger()) or (not hg_dagger and ac.variance(o) > switch2human_thresh):
                     """
@@ -419,11 +473,11 @@ def thrifty(env, iters=5, actor_critic=core.Ensemble, ac_kwargs=dict(),
                     continue
                 else:
                     risk.append(ac.safety(o, a))
-                    o2, _, d, _ = env.step(a)
+                    o2, _, d, _, _ = env.step(a)
                     act.append(a)
                     sup.append(0)
                     s = env._check_success()
-                    qbuffer.store(o, a, o2, int(s), (ep_len + 1 >= horizon) or s)
+                    # qbuffer.store(o, a, o2, int(s), (ep_len + 1 >= horizon) or s)
                 d = (ep_len + 1 >= horizon) or env._check_success()
                 done.append(d)
                 rew.append(int(env._check_success()))
@@ -456,7 +510,9 @@ def thrifty(env, iters=5, actor_critic=core.Ensemble, ac_kwargs=dict(),
         if t > 0:
             # retrain policy from scratch
             loss_pi = []
-            ac = actor_critic(env.observation_space, env.action_space, device, num_nets=num_nets, **ac_kwargs)
+            # ac = actor_critic(env.observation_space, env.action_space, device, num_nets=num_nets, **ac_kwargs)
+            ac = actor_critic(observation_space=obs_dim, action_space=act_dim, act_limit=act_limit, 
+                      device=device, num_nets=num_nets, **ac_kwargs)
             pi_optimizers = [Adam(ac.pis[i].parameters(), lr=pi_lr) for i in range(ac.num_nets)]
             for i in range(ac.num_nets):
                 if ac.num_nets > 1: # create new datasets via sampling with replacement
@@ -469,28 +525,28 @@ def thrifty(env, iters=5, actor_critic=core.Ensemble, ac_kwargs=dict(),
                 for _ in range(grad_steps * (bc_epochs + t)):
                     batch = tmp_buffer.sample_batch(batch_size)
                     loss_pi.append(update_pi(batch, i))
-        # retrain Qrisk
-        if q_learning:
-            if num_test_episodes > 0:
-                test_agent(t) # collect samples offline from pi_R
-                data = pickle.load(open('test-rollouts.pkl', 'rb'))
-                qbuffer.fill_buffer(data)
-                os.remove('test-rollouts.pkl')
-            q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
-            q_optimizer = Adam(q_params, lr=pi_lr)
-            loss_q = []
-            for _ in range(bc_epochs):
-                for i in range(grad_steps * 5):
-                    batch = qbuffer.sample_batch(batch_size // 2, pos_fraction=0.1)
-                    loss_q.append(update_q(batch, timer=i))
+        # # retrain Qrisk
+        # if q_learning:
+        #     if num_test_episodes > 0:
+        #         test_agent(t) # collect samples offline from pi_R
+        #         data = pickle.load(open('test-rollouts.pkl', 'rb'))
+        #         # qbuffer.fill_buffer(data)
+        #         os.remove('test-rollouts.pkl')
+        #     q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
+        #     q_optimizer = Adam(q_params, lr=pi_lr)
+        #     loss_q = []
+        #     for _ in range(bc_epochs):
+        #         for i in range(grad_steps * 5):
+        #             # batch = qbuffer.sample_batch(batch_size // 2, pos_fraction=0.1)
+        #             loss_q.append(update_q(batch, timer=i))
 
         # end of epoch logging
         logger.save_state(dict())
         print('Epoch', t)
         if t > 0:
             print('LossPi', sum(loss_pi)/len(loss_pi))
-        if q_learning:
-            print('LossQ', sum(loss_q)/len(loss_q))
+        # if q_learning:
+        #     print('LossQ', sum(loss_q)/len(loss_q))
         print('TotalEpisodes', ep_num)
         print('TotalSuccesses', ep_num - fail_ct)
         print('TotalEnvInteracts', total_env_interacts)

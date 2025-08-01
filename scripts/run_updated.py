@@ -155,8 +155,12 @@ if __name__ == '__main__':
         )
     # env.viewer.set_camera(camera_name=["agentview", "birdview"])
     env = VisualizationWrapper(env, indicator_configs=None)
+    # print(f"Observation space for VisualizationWrapper: {env.observation_space.shape}")  # e.g. Box(0, 1, (28,), float32)
     env = GymWrapper(env)
+    print(f"Observation space for GymWrapper: {env.observation_space.shape}") 
     env = CustomWrapper(env, render=render)
+    print(f"Observation space for CustomWrapper: {env.observation_space.shape}") 
+    
 
     arm_ = 'right'
     config_ = 'single-arm-opposed'

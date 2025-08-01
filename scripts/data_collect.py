@@ -99,6 +99,7 @@ from robosuite.controllers.composite.composite_controller import WholeBody
 from robosuite.wrappers import VisualizationWrapper
 from robosuite.robots import MobileRobot
 from robosuite.wrappers import DataCollectionWrapper
+from robosuite.wrappers import GymWrapper
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -210,20 +211,41 @@ if __name__ == "__main__":
         reward_shaping=True,
         renderer="mujoco",
     )
+
+    # env = suite.make(
+    #         **config,
+    #         has_renderer=True,
+    #         has_offscreen_renderer=False,
+    #         render_camera="agentview",
+    #         # render_camera="birdview",
+    #         ignore_done=True,
+    #         use_camera_obs=False,
+    #         reward_shaping=True,
+    #         control_freq=20,
+    #         hard_reset=True,
+    #         use_object_obs=True
+    #     )
     env.reset()
 
-    camera_name = ["agentview", "birdview"]
-    env.viewer.set_camera(camera_name=camera_name)
+    # camera_name = ["agentview", "birdview"]
+    # env.viewer.set_camera(camera_name=camera_name)
 
     # Wrap this environment in a visualization wrapper
     env = VisualizationWrapper(env, indicator_configs=None)
 
+    env = GymWrapper(env)
+    print(f"Observation space for GymWrapper: {env.observation_space.shape}")  # (63,)
+    print(f"Action space for GymWrapper: {env.action_space.shape}")  # (7,)
+
     data_directory = '/home/pouyan/phd/imitation_learning/thriftydagger/data/pouyan/'
 
     env = DataCollectionWrapper(env, data_directory)
+    print(f"Observation space for DataCollectionWrapper: {env.observation_space.shape}") # (63,)
 
     # Setup printing options for numbers
     np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
+
+    print(f"input device: {args.device}")
 
     # initialize device
     if args.device == "keyboard":
@@ -262,6 +284,7 @@ if __name__ == "__main__":
     while True:
         # Reset the environment
         obs = env.reset()
+        # print(f"Observation space: {len(obs[0])}, {type(obs[0])}")  # Observation space: 63, <class 'numpy.ndarray'>
 
         # Setup rendering
         cam_id = 0
@@ -288,9 +311,11 @@ if __name__ == "__main__":
 
             # Set active robot
             active_robot = env.robots[device.active_robot]
+            print(f"Active robot: {active_robot.name}")
 
             # Get the newest action
             input_ac_dict = device.input2action()
+            print(f"Input action dict: {input_ac_dict}")
 
             # If action is none, then this a reset so we should break
             if input_ac_dict is None:
@@ -315,9 +340,11 @@ if __name__ == "__main__":
 
             # Maintain gripper state for each robot but only update the active robot with action
             env_action = [robot.create_action_vector(all_prev_gripper_actions[i]) for i, robot in enumerate(env.robots)]
+            print(f"env_action1: {env_action}")
             env_action[device.active_robot] = active_robot.create_action_vector(action_dict)
+            print(f"env_action2: {env_action}")
             env_action = np.concatenate(env_action)
-            # print(f"env_action: {env_action}")
+            print(f"env_action3: {env_action}")
             for gripper_ac in all_prev_gripper_actions[device.active_robot]:
                 all_prev_gripper_actions[device.active_robot][gripper_ac] = action_dict[gripper_ac]
 
